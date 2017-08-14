@@ -14,7 +14,7 @@ import requests
 from filestack.config import HEADERS
 
 log = logging.getLogger(__name__)
-log.setLevel(logging.ERROR)
+log.setLevel(logging.INFO)
 
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter("%(asctime)s - %(processName)s[%(process)d] - %(levelname)s - %(message)s"))
@@ -35,6 +35,31 @@ class ResponseNotOk(Exception):
 
 class S3UploadException(Exception):
     pass
+
+
+class RequestManager(object):
+
+    def __init__(self, request):
+        self.request = request
+        self.response = None
+        self.success = False
+        self.add_timeout = False
+
+    def __enter__(self):
+        return self
+
+    def execute(self):
+        self.response = requests.Session().send(self.request.prepare())
+
+        if not self.response.ok:
+            raise ResponseNotOk('Incorrect backend response %s', self.response)
+        self.success = True
+
+    def __exit__(self, exception_type, value, traceback):
+        if exception_type == ResponseNotOk:
+            self.add_timeout = True
+
+        return True  # returning True to suppress exceptions
 
 
 class UploadManager(object):
@@ -288,70 +313,64 @@ def consume_upload_job(upload_q, response_q):
         time.sleep(delay)
         log.info('Uploader waiting for %s seconds', delay)
 
-        with open(job['filepath'], 'rb') as f:
-            f.seek(job['seek'] + job['offset'])
-            chunk = f.read(job['size'])
-
-        success = True
-        try:
-            backend_resp = requests.post(
-                UPLOAD_HOST + '/multipart/upload',
-                data={
-                    'apikey': job['apikey'],
-                    'part': job['part'],
-                    'size': job['size'],
-                    'md5': b64encode(hashlib.md5(chunk).digest()).strip(),
-                    'uri': job['uri'],
-                    'region': job['region'],
-                    'upload_id': job['upload_id'],
-                    'store_location': job['store_location'],
-                    'multipart': True,
-                    'offset': job['offset']
-                },
-                files={'file': (job['filename'], '', None)},
-                headers=HEADERS
-            )
-            if not backend_resp.ok:
-                raise ResponseNotOk('Incorrect backend response %s', backend_resp)
-
-            backend_data = backend_resp.json()
-            try:
-                s3_resp = requests.put(
-                    backend_data['url'],
-                    headers=backend_data['headers'],
-                    data=chunk
-                )
-            except Exception as e:
-                log.warning('Upload to S3 failed %s', e)
-                raise S3UploadException(str(e))
-
-            if not s3_resp.ok:
-                raise ResponseNotOk('Incorrect S3 response %s', s3_resp)
-
-        except ResponseNotOk:
-            delay = delay * 1.3 or 1
-            success = False
-        except S3UploadException:
-            delay = 0
-            success = False
-        except Exception as e:
-            delay = 0
-            log.error('Request to backend failed %s', e)
-            success = False
-
-        response_q.put({
+        uploader_response = {
             'worker': 'uploader',
             'chunk': job['chunk'],
             'part': job['part'],
             'offset': job['offset'],
             'size': job['size'],
-            'success': success,
-            'delay': delay
-        })
+            'success': False,
+            'delay': 0
+        }
+
+        with open(job['filepath'], 'rb') as f:
+            f.seek(job['seek'] + job['offset'])
+            chunk = f.read(job['size'])
+
+        backend_request = requests.Request(
+            'POST',
+            url=UPLOAD_HOST + '/multipart/upload',
+            data={
+                'apikey': job['apikey'],
+                'part': job['part'],
+                'size': job['size'],
+                'md5': b64encode(hashlib.md5(chunk).digest()).strip(),
+                'uri': job['uri'],
+                'region': job['region'],
+                'upload_id': job['upload_id'],
+                'store_location': job['store_location'],
+                'multipart': True,
+                'offset': job['offset']
+            },
+            files={'file': (job['filename'], '', None)},
+            headers=HEADERS
+        )
+        with RequestManager(backend_request) as rm:
+            rm.execute()
+
+        if rm.add_timeout:
+            delay = delay * 1.3 or 1
+
+        if rm.success:
+            backend_data = rm.response.json()
+
+            s3_request = requests.Request(
+                'PUT', url=backend_data['url'],
+                headers=backend_data['headers'], data=chunk
+            )
+            with RequestManager(s3_request) as rm:
+                rm.execute()
+            if rm.add_timeout:
+                delay = delay * 1.3 or 1
+            if rm.success:
+                uploader_response['success'] = True
+
+        uploader_response['delay'] = delay
+        response_q.put(uploader_response)
 
         log.info(
             'Uploader finished chunk %s for part %s. Success: %s',
-            job['chunk'], job['part'], success
+            job['chunk'], job['part'], uploader_response['success']
         )
 
 
