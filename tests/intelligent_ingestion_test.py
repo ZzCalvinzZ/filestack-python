@@ -35,6 +35,7 @@ def multipart_start_mock(url, request):
             'upload_id': 'my-upload-id',
             'region': 'eu-west-1',
             'uri': '/upload/apikey/image.jpg',
+            'upload_type': 'intelligent_ingestion'
         })
     }
 
@@ -78,6 +79,7 @@ def test_multipart_start(upload_manager):
         'upload_id': 'my-upload-id',
         'region': 'eu-west-1',
         'uri': '/upload/apikey/image.jpg',
+        'upload_type': 'intelligent_ingestion'
     }
 
 

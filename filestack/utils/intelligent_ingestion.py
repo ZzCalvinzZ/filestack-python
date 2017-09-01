@@ -100,18 +100,29 @@ class UploadManager(object):
                 'policy': self.security['policy'],
                 'signature': self.security['signature']
             })
-        response = requests.post(
-            UPLOAD_HOST + '/multipart/start',
+
+        start_request = requests.Request(
+            'POST',
+            url=UPLOAD_HOST + '/multipart/start',
             data=data,
             files={'file': (self.filename, '', None)},
             params=self.params,
             headers=HEADERS
         )
-        self.start_response = response.json()
+
+        with RequestManager(start_request) as rm:
+            rm.execute()
+
+        if not rm.success:
+            raise Exception('Could not start upload process')
+
+        self.start_response = rm.response.json()
+        if self.start_response.get('upload_type') != 'intelligent_ingestion':
+            raise Exception('Apikey %s not allowed to use intelligent_ingestion' % self.apikey)
 
     def _multipart_complete(self):
-        response_code = 0
-        while response_code != 200:
+        response_code = 202
+        while response_code == 202:
             log.info('Waiting for complete')
             response = requests.post(
                 UPLOAD_HOST + '/multipart/complete',
